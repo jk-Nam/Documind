@@ -308,12 +308,16 @@
   - 동일 이슈 자동 병합 (중복 제거)
   - UNIQUE 제약 조건으로 중복 생성 방지
 
-- **5가지 전략 기반 심각도 스코어링 (0~100점)**
-  1. **빈도 전략**: 발생 횟수 기반 점수 (log10 스케일)
-  2. **사용자 영향도**: 영향받은 고유 사용자 수 (Redis HyperLogLog)
-  3. **비즈니스 임팩트**: 결제/인증/핵심 기능 가중치
-  4. **차단 정도**: FATAL > ERROR > WARN 순 점수
-  5. **크래시 유형**: OutOfMemory, StackOverflow 등 치명도
+- **전략 패턴(Strategy Pattern) 기반 심각도 스코어링 (0~100점)**
+  - 5개의 독립적인 전략 클래스로 심각도 평가 로직 분리
+  - 각 전략이 개별적으로 점수 산출 후 종합 평가
+  - 신규 전략 추가/제거 시 기존 코드 수정 불필요 (OCP 원칙)
+
+  1. **FrequencyStrategy**: 발생 횟수 기반 점수 (log10 스케일)
+  2. **UserImpactStrategy**: 영향받은 고유 사용자 수 (Redis HyperLogLog)
+  3. **BusinessImpactStrategy**: 결제/인증/핵심 기능 가중치
+  4. **BlockingLevelStrategy**: FATAL > ERROR > WARN 순 점수
+  5. **CrashTypeStrategy**: OutOfMemory, StackOverflow 등 치명도
 
 - **이슈 라이프사이클 관리**
   - RECOMMENDED → TODO → IN_PROGRESS → RESOLVED
@@ -325,13 +329,14 @@
   - 실시간 알림 (Server-Sent Events)
 
 #### 기술 스택
+- 전략 패턴 (Strategy Pattern) - 심각도 평가 알고리즘 분리
 - Redis HyperLogLog (사용자 영향도 추정)
 - JPA Auditing (변경 이력 자동 추적)
 - Spring Events (도메인 이벤트 기반 알림)
 
 #### 성과
 - 동일 이슈 중복 생성: **SHA-256 핑거프린트로 완전 차단**
-- 심각도 평가: **5가지 전략 기반 객관적 스코어** 산출
+- 심각도 평가: **전략 패턴으로 확장 가능한 평가 시스템** 구축
 - 이슈 관리: **라이프사이클 + Audit Trail**로 추적성 확보
 
 ---
