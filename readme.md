@@ -258,167 +258,83 @@
 
 ---
 
+## 내가 구현한 기능
+
+### 📡 실시간 로그 수집 파이프라인 (logprocessor 도메인)
+
+#### 핵심 구현
+- **Redis Streams 기반 비동기 로그 수집**
+  - Consumer Group 패턴으로 병렬 처리
+  - 적응형 배치 크기 (100~1,000건) 동적 조정
+  - 메시지 유실 방지 (ACK 기반 신뢰성 보장)
+
+- **백프레셔 관리 시스템 (BackpressureManager)**
+  - DB 응답 시간 측정 → 배치 크기 자동 조정
+  - latency < 100ms: 배치 증가 / latency > 300ms: 배치 감소
+  - 시스템 과부하 시 우아한 성능 저하(graceful degradation)
+
+- **안정성 확보**
+  - Dead Letter Queue + 최대 5회 재시도
+  - Circuit Breaker (Resilience4j): 장애 전파 차단
+  - 심각도 기반 샘플링 (DEBUG 5% ~ ERROR 100%)
+
+- **3단계 계층형 스토리지**
+  - Hot (PostgreSQL SSD): 최근 1주일
+  - Warm (PostgreSQL HDD): 1~4주
+  - Cold (S3 Parquet): 4주 이상
+
+#### 기술 스택
+- Redis Streams, Resilience4j, Bucket4j (Rate Limiting)
+- PostgreSQL 파티셔닝 (주별 RANGE), Apache Parquet
+- Spring @Scheduled, CompletableFuture
+
+#### 성과
+- 피크 시 PEL 크기: **10,000+ → 100 이하** 개선
+- DB 과부하 시: 연쇄 실패 → **배치 축소 + 우아한 감속**
+- 장애 복구: 수동 재시작 → **Circuit Breaker 자동 복구**
+
+---
+
+### 🔍 자동 이슈 분류 & 심각도 평가 (issue 도메인)
+
+#### 핵심 구현
+- **SHA-256 핑거프린트 기반 이슈 그룹핑**
+  - 스택 트레이스 + 에러 메시지 → 해시 생성
+  - 동일 이슈 자동 병합 (중복 제거)
+  - UNIQUE 제약 조건으로 중복 생성 방지
+
+- **5가지 전략 기반 심각도 스코어링 (0~100점)**
+  1. **빈도 전략**: 발생 횟수 기반 점수 (log10 스케일)
+  2. **사용자 영향도**: 영향받은 고유 사용자 수 (Redis HyperLogLog)
+  3. **비즈니스 임팩트**: 결제/인증/핵심 기능 가중치
+  4. **차단 정도**: FATAL > ERROR > WARN 순 점수
+  5. **크래시 유형**: OutOfMemory, StackOverflow 등 치명도
+
+- **이슈 라이프사이클 관리**
+  - RECOMMENDED → TODO → IN_PROGRESS → RESOLVED
+  - 담당자 배정 + 변경 이력(Audit Trail) 자동 추적
+  - 심각도 80점 이상 자동 알림 (SSE)
+
+- **이슈 댓글 시스템**
+  - 멘션 기능 (@username)
+  - 실시간 알림 (Server-Sent Events)
+
+#### 기술 스택
+- Redis HyperLogLog (사용자 영향도 추정)
+- JPA Auditing (변경 이력 자동 추적)
+- Spring Events (도메인 이벤트 기반 알림)
+
+#### 성과
+- 동일 이슈 중복 생성: **SHA-256 핑거프린트로 완전 차단**
+- 심각도 평가: **5가지 전략 기반 객관적 스코어** 산출
+- 이슈 관리: **라이프사이클 + Audit Trail**로 추적성 확보
+
+---
+
 <a id="트러블-슈팅"></a>
 ## 🛠 트러블 슈팅
 
-### 1. Redis Streams 로그 수집 안정성 확보
-
-**📌 문제 상황**
-
-대량의 게임 로그가 동시에 유입될 때, Redis Streams 소비자가 처리 속도를 따라가지 못해
-**메시지 누적(PEL 증가)과 메모리 사용량 급증**이 발생했다.
-
-- 트래픽 피크 시 배치 처리 지연
-- DB 응답 시간 증가 시 연쇄적인 처리 실패
-- 실패한 메시지의 무한 재시도로 인한 리소스 낭비
-
-**🔍 원인 분석**
-
-1. **고정 배치 크기** — DB 부하와 무관하게 일정량을 처리하려 해서 DB 응답 지연 시 전체가 밀림
-2. **재시도 정책 부재** — 실패 메시지가 무한 재시도되며 정상 메시지 처리를 방해
-3. **백프레셔 미적용** — 소비자가 자신의 처리 능력을 초과하는 메시지를 계속 수신
-
-**✔️ 해결 방법**
-
-**1️⃣ 적응형 배치 크기 (BackpressureManager)**
-```
-DB 응답시간 측정
-  ↓
-latency < 100ms → 배치 크기 증가 (최대 1,000)
-latency > 300ms → 배치 크기 감소 (최소 100)
-```
-
-**2️⃣ Dead Letter Queue + 최대 재시도**
-```
-처리 실패 → DLQ 이동 → 5초 간격 재시도 (최대 5회) → 최종 실패 시 ACK 후 로깅
-```
-
-**3️⃣ Circuit Breaker (Resilience4j)**
-```
-최근 10건 중 50% 이상 실패 → OPEN 상태 (10초 대기) → HALF_OPEN → 복구 확인
-```
-
-**4️⃣ 심각도 기반 샘플링 (LogSamplingService)**
-
-| 심각도 | 샘플링 비율 | 이유 |
-|--------|-----------|------|
-| DEBUG | 5% | 디버그 로그는 소량만 보존 |
-| INFO | 10% | 정보성 로그 선별 저장 |
-| WARN | 50% | 주의 수준 로그 반영 |
-| ERROR/FATAL | 100% | 에러는 전수 보존 |
-
-**📊 결과**
-
-| 항목 | 개선 전 | 개선 후 |
-|------|--------|--------|
-| 피크 시 PEL 크기 | 10,000+ | 100 이하 |
-| DB 과부하 시 처리 | 연쇄 실패 | 배치 축소 + 우아한 감속 |
-| 실패 메시지 처리 | 무한 재시도 | DLQ 5회 후 정리 |
-| 장애 복구 | 수동 재시작 | Circuit Breaker 자동 복구 |
-
----
-
-### 2. RAG 벡터 검색 정확도 및 성능 최적화
-
-**📌 문제 상황**
-
-문서를 업로드하고 RAG 챗봇으로 질문했을 때,
-**관련 없는 청크가 검색되거나 한국어 키워드 검색이 누락**되는 문제가 발생했다.
-
-- 코사인 유사도만으로는 한국어 키워드 매칭이 부정확
-- 대량 벡터에서 검색 속도 저하
-- 프로젝트 간 벡터 격리가 안 돼 다른 프로젝트 문서가 검색됨
-
-**🔍 원인 분석**
-
-1. **순수 벡터 검색의 한계** — 의미적 유사도는 높지만, 정확한 키워드(기술 용어, 고유명사)를 놓침
-2. **인덱스 미적용** — 전체 테이블 스캔으로 벡터 검색 수행
-3. **메타데이터 필터 부재** — project_id 기반 격리 없이 전체 벡터에서 검색
-
-**✔️ 해결 방법**
-
-**1️⃣ 하이브리드 검색 (벡터 + pg_bigm 키워드)**
-```sql
--- 벡터 유사도 검색
-SELECT ... FROM vector_store
-WHERE embedding <=> query_embedding < threshold
-  AND metadata->>'project_id' = ?
-
--- pg_bigm 키워드 검색 (한국어 2-gram)
-AND content LIKE '%검색어%'  -- GIN 인덱스 활용
-```
-
-**2️⃣ HNSW 인덱스 적용**
-```sql
-CREATE INDEX vector_store_embedding_idx
-  ON vector_store USING hnsw (embedding vector_cosine_ops);
-```
-
-**3️⃣ 메타데이터 기반 프로젝트 격리**
-```sql
-CREATE INDEX idx_vector_store_project_id
-  ON vector_store ((metadata->>'project_id'));
-```
-
-**📊 결과**
-
-| 항목 | 개선 전 | 개선 후 |
-|------|--------|--------|
-| 한국어 키워드 매칭 | 누락 빈번 | pg_bigm GIN으로 정확 매칭 |
-| 벡터 검색 속도 | 전체 스캔 | HNSW 인덱스로 밀리초 단위 |
-| 프로젝트 격리 | 미격리 | metadata 필터로 완전 격리 |
-
----
-
-### 3. 패치노트 AI 생성 시 컨텍스트 초과 및 할루시네이션
-
-**📌 문제 상황**
-
-PendingItem이 많은 프로젝트에서 패치노트를 생성할 때,
-**LLM 컨텍스트 윈도우를 초과**하거나
-**존재하지 않는 참조를 생성(할루시네이션)**하는 문제가 발생했다.
-
-**🔍 원인 분석**
-
-1. 모든 PendingItem의 evidence(변경 근거)를 그대로 프롬프트에 넣어 토큰 초과
-2. LLM이 RAG 컨텍스트에 없는 문서를 참조하여 거짓 인용 생성
-3. 생성 중 동일 프로젝트에서 중복 요청 시 경쟁 상태 발생
-
-**✔️ 해결 방법**
-
-**1️⃣ Evidence Reducer (토큰 사용량 제어)**
-```
-토큰 추정 → 초과 시 evidence 길이 축소 → 재추정
-→ SSE로 컨텍스트 축소 비율 알림
-```
-
-**2️⃣ RefValidator (할루시네이션 제거)**
-```
-LLM 출력 파싱 → 참조된 소스 추출
-→ RAG 컨텍스트의 실제 소스와 대조
-→ 컨텍스트에 없는 참조 자동 제거
-```
-
-**3️⃣ 동시 생성 방지 (ConcurrentHashMap Lock)**
-```java
-if (!activeGenerations.add(projectId)) {
-    return Flux.just(sseConverter.errorEvent("이미 생성 중입니다"));
-}
-// ... 생성 완료 후
-doFinally(signal -> activeGenerations.remove(projectId));
-```
-
-**📊 결과**
-
-| 항목 | 개선 전 | 개선 후 |
-|------|--------|--------|
-| 대량 항목 생성 | 토큰 초과 에러 | Evidence 자동 축소 |
-| 거짓 참조 | 존재하지 않는 문서 인용 | RefValidator로 자동 제거 |
-| 중복 요청 | 경쟁 상태로 중복 생성 | 프로젝트 단위 락 |
-
----
-
-### 4. 로그 TTL 정책 수립과 스토리지 Tier 결정
+### 1. 로그 TTL 정책 수립과 스토리지 Tier 결정
 
 **📌 문제 상황**
 
@@ -493,7 +409,7 @@ CREATE TABLE game_logs_2026_w12 PARTITION OF game_logs
 
 ---
 
-### 5. FrequencyStrategy 장기 지속 이슈 계산 범위 제한
+### 2. FrequencyStrategy 장기 지속 이슈 계산 범위 제한
 
 **📌 문제 상황**
 
@@ -580,82 +496,6 @@ private int calculateFrequencyScore(Issue issue) {
 
 | 문제 | 핵심 원인 | 해결 전략 |
 |------|----------|----------|
-| 로그 수집 불안정 | 고정 배치 + 재시도 정책 부재 | 적응형 배치 + DLQ + Circuit Breaker |
-| RAG 검색 부정확 | 순수 벡터 검색 한계 | 하이브리드 검색 + HNSW + 프로젝트 격리 |
-| 패치노트 할루시네이션 | 컨텍스트 초과 + 참조 미검증 | Evidence Reducer + RefValidator |
 | 로그 TTL 정책 미확립 | 파티션 단위 및 Tier 전략 부재 | 주별 파티셔닝 + 3-Tier 스토리지 |
 | 장기 이슈 계산 오류 | Redis TTL vs 영구 저장소 불일치 | 계산 범위 7일 제한 |
-
----
-
-## 내가 구현한 기능
-
-### 📡 실시간 로그 수집 파이프라인 (logprocessor 도메인)
-
-#### 핵심 구현
-- **Redis Streams 기반 비동기 로그 수집**
-  - Consumer Group 패턴으로 병렬 처리
-  - 적응형 배치 크기 (100~1,000건) 동적 조정
-  - 메시지 유실 방지 (ACK 기반 신뢰성 보장)
-
-- **백프레셔 관리 시스템 (BackpressureManager)**
-  - DB 응답 시간 측정 → 배치 크기 자동 조정
-  - latency < 100ms: 배치 증가 / latency > 300ms: 배치 감소
-  - 시스템 과부하 시 우아한 성능 저하(graceful degradation)
-
-- **안정성 확보**
-  - Dead Letter Queue + 최대 5회 재시도
-  - Circuit Breaker (Resilience4j): 장애 전파 차단
-  - 심각도 기반 샘플링 (DEBUG 5% ~ ERROR 100%)
-
-- **3단계 계층형 스토리지**
-  - Hot (PostgreSQL SSD): 최근 1주일
-  - Warm (PostgreSQL HDD): 1~4주
-  - Cold (S3 Parquet): 4주 이상
-
-#### 기술 스택
-- Redis Streams, Resilience4j, Bucket4j (Rate Limiting)
-- PostgreSQL 파티셔닝 (주별 RANGE), Apache Parquet
-- Spring @Scheduled, CompletableFuture
-
-#### 성과
-- 피크 시 PEL 크기: **10,000+ → 100 이하** 개선
-- DB 과부하 시: 연쇄 실패 → **배치 축소 + 우아한 감속**
-- 장애 복구: 수동 재시작 → **Circuit Breaker 자동 복구**
-
----
-
-### 🔍 자동 이슈 분류 & 심각도 평가 (issue 도메인)
-
-#### 핵심 구현
-- **SHA-256 핑거프린트 기반 이슈 그룹핑**
-  - 스택 트레이스 + 에러 메시지 → 해시 생성
-  - 동일 이슈 자동 병합 (중복 제거)
-  - UNIQUE 제약 조건으로 중복 생성 방지
-
-- **5가지 전략 기반 심각도 스코어링 (0~100점)**
-  1. **빈도 전략**: 발생 횟수 기반 점수 (log10 스케일)
-  2. **사용자 영향도**: 영향받은 고유 사용자 수 (Redis HyperLogLog)
-  3. **비즈니스 임팩트**: 결제/인증/핵심 기능 가중치
-  4. **차단 정도**: FATAL > ERROR > WARN 순 점수
-  5. **크래시 유형**: OutOfMemory, StackOverflow 등 치명도
-
-- **이슈 라이프사이클 관리**
-  - RECOMMENDED → TODO → IN_PROGRESS → RESOLVED
-  - 담당자 배정 + 변경 이력(Audit Trail) 자동 추적
-  - 심각도 80점 이상 자동 알림 (SSE)
-
-- **이슈 댓글 시스템**
-  - 멘션 기능 (@username)
-  - 실시간 알림 (Server-Sent Events)
-
-#### 기술 스택
-- Redis HyperLogLog (사용자 영향도 추정)
-- JPA Auditing (변경 이력 자동 추적)
-- Spring Events (도메인 이벤트 기반 알림)
-
-#### 성과
-- 동일 이슈 중복 생성: **SHA-256 핑거프린트로 완전 차단**
-- 심각도 평가: **5가지 전략 기반 객관적 스코어** 산출
-- 이슈 관리: **라이프사이클 + Audit Trail**로 추적성 확보
 
