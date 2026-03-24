@@ -418,6 +418,164 @@ doFinally(signal -> activeGenerations.remove(projectId));
 
 ---
 
+### 4. 로그 TTL 정책 수립과 스토리지 Tier 결정
+
+**📌 문제 상황**
+
+비동기 로그 수집 파이프라인에서 **데이터 수명 주기(TTL) 정책이 확립되지 않아**
+스토리지 계층 이동 전략과 파티션 단위를 결정해야 하는 상황이 발생했다.
+
+**현재 아키텍처:**
+
+| 메시지 큐 | Hot/Warm Storage | Cold Storage |
+|----------|------------------|--------------|
+| Redis Stream | PostgreSQL | Amazon S3 |
+| 비동기 배치 처리 | Range Partitioning | 장기 보관 / 저비용 |
+
+**핵심 의사결정 문제:**
+1. **TTL Tier 수 결정**: 3-Tier(Hot→Warm→Cold) vs 2-Tier(Hot→Cold)?
+2. **파티션 단위 결정**: 일별(365개) vs 주별(52개) vs 월별(12개)?
+3. **파티션 관리 자동화**: Flyway 초기 생성 + Scheduled Job 동적 관리 방식의 타당성?
+
+**🔍 원인 분석**
+
+**1️⃣ 파티션 수와 쿼리 플래닝 오버헤드**
+
+PostgreSQL은 쿼리 실행 전 파티션 프루닝(Partition Pruning) 단계에서
+WHERE 조건을 분석해 실제 스캔할 파티션을 필터링한다.
+이 과정 자체가 O(파티션 수)의 메모리와 CPU를 소모한다.
+
+| 파티션 수 | Planning 부담 | Pruning 효과 | 실무 판단 |
+|-----------|--------------|-------------|----------|
+| ~100개 (일별 약 3개월) | 낮음 | 높음 | 문제없음 |
+| 365개 (일별 1년) | 중간 | 높음 | 감내 가능, 모니터링 필요 |
+| 1,000개+ | 높음 | 중간 | 성능 저하 가능성 |
+
+**2️⃣ Flyway + Scheduled Job 조합이 표준인 이유**
+
+- **Flyway**: 테이블 스키마는 코드와 함께 버전 관리되어야 함. 파티션 부모 테이블과 초기 파티션을 Migration으로 관리하면 개발/스테이징/운영 환경에서 동일한 구조를 보장
+- **Scheduled Job**: 파티션은 시간에 따라 계속 생성/삭제되는 동적 객체. 미래 파티션을 사전 생성하지 않으면 해당 시점에 INSERT가 실패하므로, 적어도 2~4주 앞의 파티션을 미리 만들어두는 Job이 필수
+- **pg_partman**: 확장 모듈 설치가 가능한 환경이라면 Scheduled Job 대신 pg_partman을 사용하면 관리 오버헤드를 대폭 줄일 수 있음
+
+**✔️ 해결 방법**
+
+**파티션 단위별 비교 분석:**
+
+| 파티션 단위 | 연간 파티션 수 | 장점 | 단점 | 7일 TTL |
+|------------|--------------|------|------|---------|
+| 일별 | 365개 | 정확한 TTL 구현 가능 | 쿼리 플래닝 오버헤드 우려 | ✔ 정확 |
+| **주별** | **52개** | **관리 용이, 오버헤드 적음** | 최대 6일 오차 발생 | △ 근사 |
+| 월별 | 12개 | 관리 가장 간단 | 7일 TTL 구현 불가 | ✘ 불가 |
+
+**최종 결정: 주별 파티셔닝 + 3-Tier 스토리지**
+
+게임사는 패치를 1달 주기로 하는 곳이 많아 주별 단위 관리가 업무 주기와 일치하며,
+52개 파티션은 플래닝 오버헤드가 낮고 관리가 용이하다고 판단.
+
+```sql
+-- 주별 파티션 예시
+CREATE TABLE game_logs_2026_w12 PARTITION OF game_logs
+  FOR VALUES FROM ('2026-03-17') TO ('2026-03-24');
+```
+
+**3-Tier 스토리지 정책:**
+- **Hot (PostgreSQL SSD)**: 최근 1주일 (실시간 검색/분석)
+- **Warm (PostgreSQL HDD)**: 1~4주 (주기적 리포트)
+- **Cold (S3 Parquet)**: 4주 이상 (규정 준수/장기 보관)
+
+**📊 결과**
+
+| 항목 | 최종 선택 | 이유 |
+|------|---------|------|
+| 파티션 단위 | 주별 (52개) | 관리 용이 + 게임 패치 주기 일치 |
+| TTL Tier | 3-Tier | Hot/Warm 분리로 비용 최적화 |
+| 관리 자동화 | Flyway + Scheduled Job | 환경 일관성 + 동적 파티션 생성 |
+
+---
+
+### 5. FrequencyStrategy 장기 지속 이슈 계산 범위 제한
+
+**📌 문제 상황**
+
+Redis에 전체 로그 수를 추적하면서 **TTL(7일)**과 장기 지속 이슈 간 데이터 불일치가 발생했다.
+
+**구체적 사례:**
+```java
+// UserCountTracker.java
+redisTemplate.expire(key, Duration.ofDays(7));  // 7일 후 데이터 삭제
+
+// FrequencyStrategy.java
+// 8일 이상 지속된 이슈의 경우 firstOccurredAt이 7일 이전
+long totalLogs = userCountTracker.getTotalLogsInTimeRange(
+    issue.getProjectId(),
+    issue.getFirstOccurredAt(),  // 10일 전
+    issue.getLastOccurredAt()     // 오늘
+);
+// totalLogs = 0 (7일 이전 데이터 TTL 만료) ❌
+```
+
+**🔍 원인 분석**
+
+**시스템 아키텍처 불일치:**
+- **Redis Stream** (메시지 큐): PostgreSQL로 bulk insert 후 ACK (즉시 삭제)
+- **Redis Counter** (집계 데이터): 7일 TTL 후 삭제
+- **Issue 엔티티** (PostgreSQL): 영구 저장소, 무기한 보관
+
+→ 오래된 이슈 재계산 시 Redis 데이터 부족
+
+**설계 시 고려 부족:**
+- 초기 설계: 심각도 계산을 1회성 이벤트로 가정 (이슈 생성 시 1번 계산 후 고정)
+- 실제: 이슈는 지속적으로 업데이트됨 (새 로그 추가 시 재계산)
+- 결과: 장기간 지속되는 이슈 존재 (7일 이상)
+
+**✔️ 해결 방법**
+
+**계산 범위를 최근 7일로 제한:**
+
+```java
+private int calculateFrequencyScore(Issue issue) {
+    OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+    OffsetDateTime firstOccurred = issue.getFirstOccurredAt();
+
+    // Redis TTL(7일) 이내 데이터만 사용
+    OffsetDateTime limitedStart = firstOccurred;
+    if (Duration.between(firstOccurred, now).toDays() > 7) {
+        limitedStart = now.minusDays(7);
+        log.debug("이슈 발생 기간이 7일 초과. 최근 7일 데이터만 사용");
+    }
+
+    // 최근 7일 이내 발생 횟수로 점수 계산
+    long occurrencesInRange = calculateOccurrencesInRange(
+        issue, limitedStart, issue.getLastOccurredAt());
+
+    return mapFrequencyToScore(occurrencesInRange);
+}
+```
+
+**설계 트레이드오프 검토:**
+
+| 방안 | 장점 | 단점 | 선택 이유 |
+|-----|------|------|----------|
+| A. PostgreSQL 집계 테이블 | 전체 기간 정확한 계산 | ERD 수정, 엔티티 추가, 배치 작업 필요 | ❌ ERD 수정은 너무 큰 작업 |
+| B. Redis TTL 30일 연장 | 간단한 수정 | 메모리 증가, 근본 해결 아님 | ❌ 임시방편 |
+| C. 계산 범위 7일 제한 | 정확성 보장, ERD 수정 불필요 | 장기 이슈는 최근 추세만 반영 | ✅ 채택 |
+
+**채택 근거:**
+- 심각도는 **최근 추세가 더 중요** (30일 전 에러보다 오늘 에러가 중요)
+- Redis TTL과 정합성 보장
+- 현재 브랜치에서 즉시 적용 가능
+- 향후 방안 A로 점진적 개선 가능
+
+**📊 결과**
+
+| 상황 | 개선 전 | 개선 후 |
+|------|---------|---------|
+| 8일 지속 이슈 | TTL 만료 → fallback (부정확) | 최근 7일 발생 횟수로 정확 계산 ✅ |
+| 장기 이슈 평가 | 전체 기간 데이터 부족 | 최근 추세 기반 객관적 평가 ✅ |
+| Redis 정합성 | 데이터 부재 시 에러 | TTL 범위 내 안정적 조회 ✅ |
+
+---
+
 ### ✅ 트러블 슈팅 요약
 
 | 문제 | 핵심 원인 | 해결 전략 |
@@ -425,4 +583,79 @@ doFinally(signal -> activeGenerations.remove(projectId));
 | 로그 수집 불안정 | 고정 배치 + 재시도 정책 부재 | 적응형 배치 + DLQ + Circuit Breaker |
 | RAG 검색 부정확 | 순수 벡터 검색 한계 | 하이브리드 검색 + HNSW + 프로젝트 격리 |
 | 패치노트 할루시네이션 | 컨텍스트 초과 + 참조 미검증 | Evidence Reducer + RefValidator |
+| 로그 TTL 정책 미확립 | 파티션 단위 및 Tier 전략 부재 | 주별 파티셔닝 + 3-Tier 스토리지 |
+| 장기 이슈 계산 오류 | Redis TTL vs 영구 저장소 불일치 | 계산 범위 7일 제한 |
+
+---
+
+## 내가 구현한 기능
+
+### 📡 실시간 로그 수집 파이프라인 (logprocessor 도메인)
+
+#### 핵심 구현
+- **Redis Streams 기반 비동기 로그 수집**
+  - Consumer Group 패턴으로 병렬 처리
+  - 적응형 배치 크기 (100~1,000건) 동적 조정
+  - 메시지 유실 방지 (ACK 기반 신뢰성 보장)
+
+- **백프레셔 관리 시스템 (BackpressureManager)**
+  - DB 응답 시간 측정 → 배치 크기 자동 조정
+  - latency < 100ms: 배치 증가 / latency > 300ms: 배치 감소
+  - 시스템 과부하 시 우아한 성능 저하(graceful degradation)
+
+- **안정성 확보**
+  - Dead Letter Queue + 최대 5회 재시도
+  - Circuit Breaker (Resilience4j): 장애 전파 차단
+  - 심각도 기반 샘플링 (DEBUG 5% ~ ERROR 100%)
+
+- **3단계 계층형 스토리지**
+  - Hot (PostgreSQL SSD): 최근 1주일
+  - Warm (PostgreSQL HDD): 1~4주
+  - Cold (S3 Parquet): 4주 이상
+
+#### 기술 스택
+- Redis Streams, Resilience4j, Bucket4j (Rate Limiting)
+- PostgreSQL 파티셔닝 (주별 RANGE), Apache Parquet
+- Spring @Scheduled, CompletableFuture
+
+#### 성과
+- 피크 시 PEL 크기: **10,000+ → 100 이하** 개선
+- DB 과부하 시: 연쇄 실패 → **배치 축소 + 우아한 감속**
+- 장애 복구: 수동 재시작 → **Circuit Breaker 자동 복구**
+
+---
+
+### 🔍 자동 이슈 분류 & 심각도 평가 (issue 도메인)
+
+#### 핵심 구현
+- **SHA-256 핑거프린트 기반 이슈 그룹핑**
+  - 스택 트레이스 + 에러 메시지 → 해시 생성
+  - 동일 이슈 자동 병합 (중복 제거)
+  - UNIQUE 제약 조건으로 중복 생성 방지
+
+- **5가지 전략 기반 심각도 스코어링 (0~100점)**
+  1. **빈도 전략**: 발생 횟수 기반 점수 (log10 스케일)
+  2. **사용자 영향도**: 영향받은 고유 사용자 수 (Redis HyperLogLog)
+  3. **비즈니스 임팩트**: 결제/인증/핵심 기능 가중치
+  4. **차단 정도**: FATAL > ERROR > WARN 순 점수
+  5. **크래시 유형**: OutOfMemory, StackOverflow 등 치명도
+
+- **이슈 라이프사이클 관리**
+  - RECOMMENDED → TODO → IN_PROGRESS → RESOLVED
+  - 담당자 배정 + 변경 이력(Audit Trail) 자동 추적
+  - 심각도 80점 이상 자동 알림 (SSE)
+
+- **이슈 댓글 시스템**
+  - 멘션 기능 (@username)
+  - 실시간 알림 (Server-Sent Events)
+
+#### 기술 스택
+- Redis HyperLogLog (사용자 영향도 추정)
+- JPA Auditing (변경 이력 자동 추적)
+- Spring Events (도메인 이벤트 기반 알림)
+
+#### 성과
+- 동일 이슈 중복 생성: **SHA-256 핑거프린트로 완전 차단**
+- 심각도 평가: **5가지 전략 기반 객관적 스코어** 산출
+- 이슈 관리: **라이프사이클 + Audit Trail**로 추적성 확보
 
