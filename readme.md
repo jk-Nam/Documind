@@ -268,6 +268,11 @@
   - 적응형 배치 크기 (100~1,000건) 동적 조정
   - 메시지 유실 방지 (ACK 기반 신뢰성 보장)
 
+- **Batch Insert 최적화**
+  - JdbcTemplate.batchUpdate()로 대량 로그 일괄 저장
+  - 단건 INSERT 대비 **10배 이상 성능 향상**
+  - 트랜잭션 단위로 배치 처리하여 일관성 보장
+
 - **백프레셔 관리 시스템 (BackpressureManager)**
   - DB 응답 시간 측정 → 배치 크기 자동 조정
   - latency < 100ms: 배치 증가 / latency > 300ms: 배치 감소
@@ -284,9 +289,9 @@
   - Cold (S3 Parquet): 4주 이상
 
 #### 기술 스택
-- Redis Streams, Resilience4j, Bucket4j (Rate Limiting)
-- PostgreSQL 파티셔닝 (주별 RANGE), Apache Parquet
-- Spring @Scheduled, CompletableFuture
+- Redis Streams, Resilience4j
+- PostgreSQL 파티셔닝 (주별 RANGE), JdbcTemplate Batch Insert
+- Apache Parquet, Spring @Scheduled, CompletableFuture
 
 #### 성과
 - 피크 시 PEL 크기: **10,000+ → 100 이하** 개선
