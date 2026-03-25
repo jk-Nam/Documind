@@ -10,8 +10,8 @@
 
 
 <p align="center">
-  <a href="[Notion링크]">
-    <img src="https://fine-airport-005.notion.site/4-a10fc0d27a98837488f881ffec988a07?source=copy_link" />
+  <a href="https://fine-airport-005.notion.site/4-a10fc0d27a98837488f881ffec988a07?source=copy_link">
+    <img src="https://img.shields.io/badge/Notion-Team%20Docs-000000?logo=notion&logoColor=white" />
   </a>
 </p>
 
