@@ -7,14 +7,14 @@
 <p align="center">
   <img src="./docs/mainpage.png" alt="DocuMind 메인 대시보드" width="800" />
 </p>
-
-
 <p align="center">
+  <a href="http://3.36.98.160.nip.io:8080">
+    <img src="https://img.shields.io/badge/🚀_Live_Demo-DocuMind-4285F4?style=for-the-badge" />
+  </a>
   <a href="https://fine-airport-005.notion.site/4-a10fc0d27a98837488f881ffec988a07?source=copy_link">
     <img src="https://img.shields.io/badge/Notion-Team%20Docs-000000?logo=notion&logoColor=white" />
   </a>
 </p>
-
 ---
 
 <a id="프로젝트-소개"></a>
