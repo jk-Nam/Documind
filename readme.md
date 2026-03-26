@@ -8,7 +8,7 @@
   <img src="./docs/mainpage.png" alt="DocuMind 메인 대시보드" width="800" />
 </p>
 <p align="center">
-  <a href="http://3.36.98.160.nip.io:8080">
+  <a href="http://43.201.190.32.nip.io:8080">
     <img src="https://img.shields.io/badge/🚀_Live_Demo-DocuMind-4285F4?style=for-the-badge" />
   </a>
 </p>
