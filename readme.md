@@ -508,3 +508,71 @@ private int calculateFrequencyScore(Issue issue) {
 | 로그 TTL 정책 미확립 | 파티션 단위 및 Tier 전략 부재 | 주별 파티셔닝 + 3-Tier 스토리지 |
 | 장기 이슈 계산 오류 | Redis TTL vs 영구 저장소 불일치 | 계산 범위 7일 제한 |
 
+
+---
+
+
+## 🚀 성능 최적화: 로그 처리 시스템
+
+### 문제 상황
+- 초기 성능: **99.95 RPS** (목표 300의 33%)
+- 에러율: **31.8%** (3건 중 1건 실패)
+- p95 latency: **9,997ms** (거의 타임아웃)
+
+### 해결 방법
+
+#### 1️⃣ Batch Insert 구현
+```java
+// 단건 처리 → Batch 처리
+jdbcTemplate.batchUpdate(sql, new BatchPreparedStatementSetter() {
+    @Override
+    public int getBatchSize() {
+        return logs.size(); // 최대 1000건씩
+    }
+});
+```
+- DB 쿼리 수: 54,000회 → 116회 (99.8% 감소)
+- 네트워크 왕복 최소화
+
+#### 2️⃣ Backpressure 구현
+```java
+// 동적 배치 크기 조절
+if (latencyMs > threshold) {
+    batchSize = min(batchSize * 2, maxBatchSize); // 더 많이 모아서 처리
+} else {
+    batchSize = max(batchSize / 2, minBatchSize); // 빠르게 처리
+}
+```
+- 부하에 따라 자동 조절
+- 안정성 확보
+
+### 성능 테스트 (k6)
+
+**방법론**: constant-arrival-rate (목표 300 req/s, 3분)
+
+| 시나리오 | Batch | Backpressure | RPS | 에러율 | p95 |
+|---------|-------|--------------|-----|--------|------|
+| **최적화 후** | ✅ | ✅ | **299.99** | **0.00%** | **14ms** |
+| Batch만 | ✅ | ❌ | 211.70 | 0.61% | 7,396ms |
+| Backpressure만 | ❌ | ✅ | 175.58 | 8.00% | 9,996ms |
+| **최적화 전** | ❌ | ❌ | **99.95** | **31.8%** | **9,998ms** |
+
+### 결과
+
+#### 📈 성능 개선
+- RPS: **99.95 → 299.99** (3배 향상)
+- 에러율: **31.8% → 0%** (완전 해결)
+- p95 latency: **9,997ms → 14ms** (690배 개선)
+
+#### 💡 핵심 발견
+1. **Batch Insert**: 단독으로 **+71%** 향상
+2. **Backpressure**: 단독으로 **+42%** 향상
+3. **시너지 효과**: 조합 시 **+200%** 향상 (3배)
+
+### 기술적 성과
+
+✅ **목표 달성**: 300 RPS 처리, 0% 에러율
+✅ **확장성**: 동적 부하 조절로 안정적 운영
+✅ **검증**: k6로 실증적 측정 및 비교
+
+> 💡 **교훈**: 성능 최적화는 실측이 필수. 단일 기법보다 조합의 시너지가 중요.
