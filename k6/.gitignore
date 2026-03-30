@@ -1,0 +1,11 @@
+# k6 테스트 결과 파일
+results/
+*.json
+*-summary.json
+
+# 로그 파일
+*.log
+
+# OS 파일
+.DS_Store
+Thumbs.db

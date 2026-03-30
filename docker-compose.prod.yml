@@ -1,0 +1,102 @@
+services:
+  # Spring Boot API (배포용)
+  api:
+    build: .
+    profiles: ["prod-test"]
+    image: documind-api:latest
+    container_name: documind-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./application-prod.yml:/app/config/application-prod.yml:ro
+    env_file:
+      - .env
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - SPRING_CONFIG_IMPORT=optional:file:/app/config/application-prod.yml
+      - DB_PASSWORD=${DB_PASSWORD}
+    depends_on:
+      - redis
+      - postgres
+
+  # Database (PostgreSQL + PGVector)
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    container_name: documind-postgres
+    env_file: .env
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_DB=${DB_NAME:-documind_db}
+      - POSTGRES_USER=${DB_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+
+  # Redis
+  redis:
+    image: redis:alpine
+    container_name: documind-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+
+  # InfluxDB (k6 메트릭 저장용)
+  influxdb:
+    image: influxdb:1.8
+    container_name: documind-influxdb
+    ports:
+      - "${INFLUX_PORT:-8086}:8086"
+    environment:
+      - INFLUXDB_DB=k6
+    volumes:
+      - influxdb-data:/var/lib/influxdb
+
+  # Grafana (k6 메트릭 시각화)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: documind-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - influxdb
+
+  # K6 (부하 테스트, 수동 실행용)
+  k6:
+    image: grafana/k6:latest
+    container_name: log-k6
+    profiles: ["prod-test"]
+    volumes:
+      - ./k6-scripts:/scripts
+    environment:
+      - K6_OUT=influxdb=http://influxdb:8086/k6
+
+  # LocalStack (S3 로컬 테스트용, 선택사항)
+  localstack:
+      image: localstack/localstack:latest
+      container_name: documind-s3-local
+      ports:
+          - "4566:4566"
+      environment:
+          - SERVICES=s3
+          - DEFAULT_REGION=ap-northeast-2
+      volumes:
+          - localstack-data:/var/lib/localstack
+          - "./init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh"
+
+volumes:
+    postgres-data:
+    redis-data:
+    influxdb-data:
+    grafana-data:
+    localstack-data:
