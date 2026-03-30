@@ -158,7 +158,7 @@ app:
 
   rate-limit:
     ingest:
-      capacity: 50 # 초당 허용할 최대 API 요청 횟수
+      capacity: 100000 # 초당 허용할 최대 API 요청 횟수 (사실상 무제한)
       expiration-hours: 1 # 버킷 메모리 유지 시간 (hour 단위)
       redis-prefix: "ratelimit:ingest"
     query:
